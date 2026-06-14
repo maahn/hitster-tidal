@@ -1,0 +1,20 @@
+services:
+  hitster-tidal:
+    build:
+      context: https://github.com/maahn/hitster-tidal.git
+      # Docker clones this repo and uses its Dockerfile automatically.
+      # To pin a specific branch or tag:
+      # context: https://github.com/maahn/hitster-tidal.git#main
+    container_name: hitster-tidal
+    ports:
+      - "6001:6001"
+    volumes:
+      # Persists Tidal token, TLS cert, and Tidal ID caches between restarts.
+      # Change the left side to any host path you prefer.
+      - /docker/hitster-tidal/data:/data
+    environment:
+      FLASK_PORT: "6001"
+      COUNTDOWN_SEC: "3"
+      CACHE_DIR: "/data/cache"
+      TOKEN_FILE: "/data/tidal_token.json"
+    restart: unless-stopped

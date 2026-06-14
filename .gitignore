@@ -1,0 +1,33 @@
+# Tidal auth token — contains your personal access token, never commit this
+tidal_token.json
+/data/tidal_token.json
+
+# TLS certificates — auto-generated on first run
+cert.pem
+key.pem
+/data/cert.pem
+/data/key.pem
+
+# Tidal ID caches — regenerated automatically from the songseeker CSVs
+*-tidal-cache.csv
+/data/cache/
+
+# SongSeeker CSV files — fetched at runtime from the songseeker-hitster-playlists repo
+hitster-*.csv
+playlists.csv
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# macOS
+.DS_Store
+
+# Docker
+*.log
+-e 
+# Local data directory (created automatically when running without Docker)
+data/
