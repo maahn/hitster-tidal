@@ -6,13 +6,7 @@ FROM python:3.13-slim
 WORKDIR /app
 
 # Install Python dependencies
-RUN pip install --no-cache-dir \
-    flask \
-    tidalapi \
-    pandas \
-    requests \
-    pyopenssl \
-    cryptography
+RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy app from build context (= the cloned repo)
 COPY . .

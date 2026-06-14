@@ -49,7 +49,7 @@ docker compose build --no-cache && docker compose up -d
 ### Without Docker (local development)
 
 ```bash
-pip install flask tidalapi pandas requests pyopenssl cryptography
+pip install -r requirements.txt
 python app.py
 # Data (token, certs, cache) is stored in ./data/ next to app.py
 ```
