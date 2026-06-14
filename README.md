@@ -30,41 +30,18 @@ The image is built directly from this GitHub repository — no manual cloning ne
 # 1. Copy docker-compose.yml to your server, then:
 docker compose up --build -d
 
-# 2. Open on your desktop to complete the one-time Tidal login
-open https://localhost:6001
+# 2. Open to complete the one-time Tidal login
+open https://192.168.x.x:6001
 # Accept the certificate warning: Advanced → Proceed
 
 # 3. Click "Log in to Tidal", authenticate, done.
 #    The token is saved to the volume and reused on every restart.
 
-# 4. Open on your phone (same Wi-Fi network):
-open https://192.168.x.x:6001
+# 4. have fun!
 ```
 
 **`docker-compose.yml`**
-```yaml
-services:
-  hitster-tidal:
-    build:
-      context: https://github.com/maahn/hitster-tidal.git
-      # Docker clones this repo automatically — no local checkout needed.
-      # Pin a release with: ...hitster-tidal.git#v1.0
-    container_name: hitster-tidal
-    ports:
-      - "6001:6001"
-    volumes:
-      # Persists Tidal token, TLS cert, and Tidal ID caches between restarts.
-      # Change the left side to any host path you prefer.
-      - /docker/hitster-tidal/data:/data
-    environment:
-      FLASK_PORT: "6001"
-      COUNTDOWN_SEC: "3"
-      CACHE_DIR: "/data/cache"
-      TOKEN_FILE: "/data/tidal_token.json"
-    restart: unless-stopped
-```
-
-To update to the latest version:
+See `docker-compose.yml` file. To update to the latest version:
 ```bash
 docker compose build --no-cache && docker compose up -d
 ```

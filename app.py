@@ -617,6 +617,7 @@ input[type=text]:focus{border-color:var(--cyan)}
   <div class="hdr">
     <div class="logo">Hitster × Tidal</div>
     <button class="reset-btn" onclick="doReset()">↺ Reset</button>
+    <button class="reset-btn" onclick="changeGame()">⇄ Change Game</button>
   </div>
 
   <!-- 1. Tidal OAuth -->
@@ -936,7 +937,25 @@ function submitManual(){
   fetch('/api/play',{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({card_number:val})});
 }
-function doReset(){audioStarted=false;currentAudio=null;fetch('/api/reset',{method:'POST'});}
+function doReset(){
+    audioStarted=false;
+    currentAudio=null;
+    fetch('/api/reset',{method:'POST'});
+}
+
+function changeGame() {
+  audioStarted = false;
+  if (currentAudio) { currentAudio.pause(); currentAudio.src = ''; currentAudio = null; }
+  fetch('/api/reset', {method:'POST'});
+  // Hide scanner and manual entry, show game selector
+  document.getElementById('scanner-card').style.display = 'none';
+  document.getElementById('manual-card').style.display  = 'none';
+  document.getElementById('track-card').style.display   = 'none';
+  document.getElementById('select-btn').textContent     = 'Load Game & Start Caching';
+  document.getElementById('select-btn').disabled        = false;
+  document.getElementById('progress-wrap').style.display = 'none';
+  gameLoaded = false;
+}
 
 // ── Boot ───────────────────────────────────────────────────
 (async()=>{
