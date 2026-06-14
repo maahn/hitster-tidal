@@ -5,6 +5,9 @@ Hitster × Tidal Player
 Scan a Hitster QR code → look up the track via a community CSV →
 search/cache on Tidal → stream in-browser via tidalapi.
 
+Multiple independent game sessions are supported — each browser tab/device
+gets its own session cookie and maintains its own state.
+
 See README.md for full setup instructions.
 """
 
@@ -15,12 +18,13 @@ import os
 import re
 import threading
 import time
+import uuid
 from pathlib import Path
 
 import pandas as pd
 import requests as req
 import tidalapi
-from flask import Flask, Response, jsonify, render_template_string, request
+from flask import Flask, jsonify, make_response, render_template_string, request
 
 # ─────────────────────────────────────────────────────────
 #  Config  (override via environment variables in Docker)
@@ -33,7 +37,6 @@ RAW_BASE_URL = (
     "https://raw.githubusercontent.com/andygruber/songseeker-hitster-playlists/main/"
 )
 
-# Use /data in Docker, ./data locally — override any time via env vars
 _IN_DOCKER = Path("/.dockerenv").exists()
 _DATA_ROOT = Path("/data") if _IN_DOCKER else Path(__file__).parent / "data"
 
@@ -41,13 +44,13 @@ CACHE_DIR = Path(os.environ.get("CACHE_DIR", str(_DATA_ROOT / "cache")))
 TOKEN_FILE = Path(os.environ.get("TOKEN_FILE", str(_DATA_ROOT / "tidal_token.json")))
 COUNTDOWN_SEC = int(os.environ.get("COUNTDOWN_SEC", "0"))
 FLASK_PORT = int(os.environ.get("FLASK_PORT", "6001"))
+SESSION_COOKIE = "hitster_session"
 
 # ─────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 app = Flask(__name__)
 
-# Suppress noisy per-request poll logs
 import logging as _logging
 
 
@@ -59,38 +62,73 @@ class _NoStateFilter(_logging.Filter):
 
 _logging.getLogger("werkzeug").addFilter(_NoStateFilter())
 
-# ── Global state ──
-state_lock = threading.Lock()
-state = {
-    "status": "idle",  # idle | searching | countdown | playing | error
-    "card_number": None,
-    "stream_url": None,
-    "tidal_url": None,
-    "countdown": 0,
-    "error": None,
-    # playlist / game selection
-    "active_game": None,
-    "active_file": None,
-    "cache_status": "idle",  # idle | building | done | error
-    "cache_progress": 0,
-    "cache_total": 0,
-    # oauth
-    "oauth_url": None,
-    "oauth_done": False,
-}
 
+# ─────────────────────────────────────────────────────────
+#  Per-session state
+# ─────────────────────────────────────────────────────────
+# sessions: { session_id -> { state: dict, lock: Lock, active_df: DataFrame|None } }
+sessions: dict = {}
+sessions_lock = threading.Lock()
+
+
+def _blank_state() -> dict:
+    return {
+        "status": "idle",
+        "card_number": None,
+        "stream_url": None,
+        "tidal_url": None,
+        "countdown": 0,
+        "error": None,
+        "active_game": None,
+        "active_file": None,
+        "cache_status": "idle",
+        "cache_progress": 0,
+        "cache_total": 0,
+    }
+
+
+def get_session(session_id: str) -> dict:
+    """Return the session dict, creating it if needed."""
+    with sessions_lock:
+        if session_id not in sessions:
+            sessions[session_id] = {
+                "state": _blank_state(),
+                "lock": threading.Lock(),
+                "active_df": None,
+            }
+        return sessions[session_id]
+
+
+def get_or_create_session_id() -> tuple[str, bool]:
+    """Return (session_id, is_new) from the request cookie."""
+    sid = request.cookies.get(SESSION_COOKIE)
+    is_new = not sid or sid not in sessions
+    if is_new:
+        sid = str(uuid.uuid4())
+    return sid, is_new
+
+
+def session_response(resp, session_id: str, is_new: bool):
+    """Attach the session cookie if it was just created."""
+    if is_new:
+        resp.set_cookie(SESSION_COOKIE, session_id, samesite="Lax", httponly=True)
+    return resp
+
+
+# ─────────────────────────────────────────────────────────
+#  Global shared resources (Tidal session, playlists index)
+# ─────────────────────────────────────────────────────────
 _tidal_session = None
-_playlists_df = None  # index → (File, Game)
-_active_df = None  # loaded card CSV for the active game
+_tidal_lock = threading.Lock()
+_tidal_oauth = {"url": None, "done": False}  # shown in every browser until login
+_playlists_df = None
 
 
-# ─────────────────────────────────────────────────────────
-#  Tidal OAuth  (non-blocking: URL surfaced to browser)
-# ─────────────────────────────────────────────────────────
-def get_tidal_session() -> tidalapi.Session:
+def get_tidal_session() -> tidalapi.Session | None:
     global _tidal_session
-    if _tidal_session and _tidal_session.check_login():
-        return _tidal_session
+    with _tidal_lock:
+        if _tidal_session and _tidal_session.check_login():
+            return _tidal_session
 
     session = tidalapi.Session()
     if TOKEN_FILE.exists():
@@ -104,24 +142,22 @@ def get_tidal_session() -> tidalapi.Session:
             )
             if session.check_login():
                 log.info("Tidal: restored cached session.")
-                _tidal_session = session
-                with state_lock:
-                    state["oauth_done"] = True
+                with _tidal_lock:
+                    _tidal_session = session
+                _tidal_oauth["done"] = True
                 return session
         except Exception as e:
             log.warning("Tidal restore failed: %s", e)
 
-    # Start device OAuth — surface URL to browser, don't block server startup
     log.info("Tidal: starting OAuth flow …")
     login, future = session.login_oauth()
-    with state_lock:
-        raw_url = login.verification_uri_complete or ""
-        if raw_url and not raw_url.startswith("http"):
-            raw_url = "https://" + raw_url
-        state["oauth_url"] = raw_url
-        state["oauth_done"] = False
+    raw_url = login.verification_uri_complete or ""
+    if raw_url and not raw_url.startswith("http"):
+        raw_url = "https://" + raw_url
+    _tidal_oauth["url"] = raw_url
+    _tidal_oauth["done"] = False
 
-    def _wait_for_login():
+    def _wait():
         global _tidal_session
         try:
             future.result()
@@ -136,29 +172,25 @@ def get_tidal_session() -> tidalapi.Session:
                     }
                 )
             )
-            _tidal_session = session
-            with state_lock:
-                state["oauth_done"] = True
-                state["oauth_url"] = None
+            with _tidal_lock:
+                _tidal_session = session
+            _tidal_oauth["url"] = None
+            _tidal_oauth["done"] = True
             log.info("Tidal: OAuth complete, token cached.")
         except Exception as e:
             log.error("Tidal OAuth failed: %s", e)
 
-    threading.Thread(target=_wait_for_login, daemon=True).start()
-    return None  # not yet authenticated
+    threading.Thread(target=_wait, daemon=True).start()
+    return None
 
 
-# ─────────────────────────────────────────────────────────
-#  Playlist index (fetched from GitHub at startup)
-# ─────────────────────────────────────────────────────────
 def fetch_playlists_index() -> pd.DataFrame:
     global _playlists_df
     if _playlists_df is not None:
         return _playlists_df
-    log.info("Fetching playlists index from %s …", PLAYLISTS_INDEX_URL)
+    log.info("Fetching playlists index …")
     r = req.get(PLAYLISTS_INDEX_URL, timeout=10)
     r.raise_for_status()
-    # Try tab-separated first, fall back to comma
     try:
         df = pd.read_csv(io.StringIO(r.text), sep="\t", quotechar='"')
         if "File" not in df.columns:
@@ -175,24 +207,21 @@ def fetch_card_csv(filename: str) -> pd.DataFrame:
     log.info("Fetching card CSV: %s", url)
     r = req.get(url, timeout=15)
     r.raise_for_status()
-    # CSVs in the repo are tab-separated
     try:
         df = pd.read_csv(io.StringIO(r.text), sep="\t", quotechar='"')
         if "Card#" not in df.columns:
-            raise ValueError("No Card# column — trying comma separator")
+            raise ValueError
     except Exception:
         df = pd.read_csv(io.StringIO(r.text), sep=",", quotechar='"')
     df["Card#"] = df["Card#"].astype(int)
-    df = df.set_index("Card#")
-    return df
+    return df.set_index("Card#")
 
 
 # ─────────────────────────────────────────────────────────
-#  Tidal search + cache
+#  Tidal cache (shared across sessions — keyed by filename)
 # ─────────────────────────────────────────────────────────
 def cache_path_for(filename: str) -> Path:
-    stem = Path(filename).stem
-    return CACHE_DIR / f"{stem}-tidal-cache.csv"
+    return CACHE_DIR / f"{Path(filename).stem}-tidal-cache.csv"
 
 
 def load_tidal_cache(filename: str) -> dict:
@@ -201,12 +230,11 @@ def load_tidal_cache(filename: str) -> dict:
         return {}
     try:
         df = pd.read_csv(cp, index_col="Card#")
-        result = {}
-        for idx, row in df.iterrows():
-            tid = row["TidalID"]
-            if pd.notna(tid):
-                result[str(int(idx))] = int(tid)
-        return result
+        return {
+            str(int(idx)): int(row["TidalID"])
+            for idx, row in df.iterrows()
+            if pd.notna(row["TidalID"])
+        }
     except Exception as e:
         log.warning("Could not load cache %s: %s", cp, e)
         return {}
@@ -214,9 +242,8 @@ def load_tidal_cache(filename: str) -> dict:
 
 def save_tidal_cache(filename: str, rows: list):
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    cp = cache_path_for(filename)
-    pd.DataFrame(rows).set_index("Card#").to_csv(cp)
-    log.info("Tidal cache saved to %s.", cp)
+    pd.DataFrame(rows).set_index("Card#").to_csv(cache_path_for(filename))
+    log.info("Tidal cache saved: %s", cache_path_for(filename))
 
 
 def search_tidal(title: str, artist: str):
@@ -235,66 +262,90 @@ def search_tidal(title: str, artist: str):
     return tracks[0]
 
 
-def build_cache_async(filename: str, df: pd.DataFrame):
-    """Build the Tidal ID cache in a background thread."""
-    cp = cache_path_for(filename)
-    if cp.exists():
-        log.info("Cache already exists for %s.", filename)
-        with state_lock:
-            state["cache_status"] = "done"
-        return
+# One cache-build lock per filename so two sessions don't double-build
+_cache_build_locks: dict[str, threading.Lock] = {}
+_cache_build_locks_lock = threading.Lock()
 
-    with state_lock:
-        state["cache_status"] = "building"
-        state["cache_progress"] = 0
-        state["cache_total"] = len(df)
 
-    rows = []
-    for i, (card_number, row) in enumerate(df.iterrows()):
-        artist = str(row.get("Artist", ""))
-        title = str(row.get("Title", ""))
-        tidal_id = None
+def build_cache_async(filename: str, df: pd.DataFrame, sess: dict):
+    with _cache_build_locks_lock:
+        if filename not in _cache_build_locks:
+            _cache_build_locks[filename] = threading.Lock()
+    file_lock = _cache_build_locks[filename]
+
+    def _run():
+        if not file_lock.acquire(blocking=False):
+            # Another session is already building this cache — just wait and report done
+            file_lock.acquire()
+            file_lock.release()
+            with sess["lock"]:
+                sess["state"]["cache_status"] = "done"
+            return
+
         try:
-            track = search_tidal(title, artist)
-            tidal_id = track.id if track else None
-        except Exception as e:
-            log.warning("Card %s (%s – %s): %s", card_number, artist, title, e)
-        log.info(
-            "  [%d/%d] Card %-5s  %-25s → %s",
-            i + 1,
-            len(df),
-            card_number,
-            f"{artist[:12]} – {title[:12]}",
-            tidal_id or "NOT FOUND",
-        )
-        rows.append({"Card#": card_number, "TidalID": tidal_id})
-        with state_lock:
-            state["cache_progress"] = i + 1
-        time.sleep(0.15)
+            if cache_path_for(filename).exists():
+                with sess["lock"]:
+                    sess["state"]["cache_status"] = "done"
+                return
 
-    save_tidal_cache(filename, rows)
-    with state_lock:
-        state["cache_status"] = "done"
+            with sess["lock"]:
+                sess["state"].update(
+                    {
+                        "cache_status": "building",
+                        "cache_progress": 0,
+                        "cache_total": len(df),
+                    }
+                )
+            rows = []
+            for i, (card_number, row) in enumerate(df.iterrows()):
+                artist = str(row.get("Artist", ""))
+                title_ = str(row.get("Title", ""))
+                tidal_id = None
+                try:
+                    track = search_tidal(title_, artist)
+                    tidal_id = track.id if track else None
+                except Exception as e:
+                    log.warning("Card %s: %s", card_number, e)
+                log.info(
+                    "  [%d/%d] Card %-5s  %-25s → %s",
+                    i + 1,
+                    len(df),
+                    card_number,
+                    f"{artist[:12]} – {title_[:12]}",
+                    tidal_id or "NOT FOUND",
+                )
+                rows.append({"Card#": card_number, "TidalID": tidal_id})
+                with sess["lock"]:
+                    sess["state"]["cache_progress"] = i + 1
+                time.sleep(0.15)
+
+            save_tidal_cache(filename, rows)
+            with sess["lock"]:
+                sess["state"]["cache_status"] = "done"
+        finally:
+            file_lock.release()
+
+    threading.Thread(target=_run, daemon=True).start()
 
 
 # ─────────────────────────────────────────────────────────
-#  Card processing pipeline
+#  Card processing pipeline (per session)
 # ─────────────────────────────────────────────────────────
 def extract_card_number(url: str):
     m = re.search(r"/(\d+)$", url)
     return m.group(1) if m else None
 
 
-def process_card(card_number: str):
+def process_card(session_id: str, card_number: str):
+    sess = get_session(session_id)
     try:
-        with state_lock:
-            filename = state.get("active_file")
-            df = _active_df
+        with sess["lock"]:
+            filename = sess["state"].get("active_file")
+            df = sess["active_df"]
 
         if df is None or filename is None:
             raise RuntimeError("No game selected. Please choose a game first.")
 
-        # Look up card
         try:
             row = df.loc[int(card_number)]
             artist = str(row.get("Artist", ""))
@@ -302,11 +353,10 @@ def process_card(card_number: str):
         except KeyError:
             raise RuntimeError(f"Card #{card_number} not found in the selected game.")
 
-        # Server-side only — never sent to browser
-        log.info("Card %s → %s – %s", card_number, artist, title)
+        log.info("[%s] Card %s → %s – %s", session_id[:8], card_number, artist, title)
 
-        with state_lock:
-            state.update(
+        with sess["lock"]:
+            sess["state"].update(
                 {
                     "status": "searching",
                     "stream_url": None,
@@ -315,18 +365,22 @@ def process_card(card_number: str):
                 }
             )
 
-        # Tidal lookup: prefer cache
         cache = load_tidal_cache(filename)
         cached = cache.get(str(int(card_number)))
-        session = get_tidal_session()
-        if session is None:
+        tidal = get_tidal_session()
+        if tidal is None:
             raise RuntimeError(
                 "Not authenticated with Tidal. Please complete OAuth first."
             )
 
         if cached:
-            log.info("Cache hit: card %s → Tidal ID %s", card_number, cached)
-            track = session.track(cached)
+            log.info(
+                "[%s] Cache hit: card %s → Tidal ID %s",
+                session_id[:8],
+                card_number,
+                cached,
+            )
+            track = tidal.track(cached)
         else:
             track = search_tidal(title, artist)
 
@@ -334,28 +388,31 @@ def process_card(card_number: str):
             raise RuntimeError(f"Not found on Tidal: {title} – {artist}")
 
         log.info(
-            "Tidal match: %s – %s (id=%s)", track.artist.name, track.name, track.id
+            "[%s] Tidal match: %s – %s (id=%s)",
+            session_id[:8],
+            track.artist.name,
+            track.name,
+            track.id,
         )
 
         tidal_url = f"https://listen.tidal.com/track/{track.id}"
         stream_url = track.get_url()
 
-        with state_lock:
-            state.update({"tidal_url": tidal_url, "stream_url": stream_url})
+        with sess["lock"]:
+            sess["state"].update({"tidal_url": tidal_url, "stream_url": stream_url})
 
-        # Countdown
         for i in range(COUNTDOWN_SEC, 0, -1):
-            with state_lock:
-                state.update({"status": "countdown", "countdown": i})
+            with sess["lock"]:
+                sess["state"].update({"status": "countdown", "countdown": i})
             time.sleep(1)
 
-        with state_lock:
-            state.update({"status": "playing", "countdown": 0})
+        with sess["lock"]:
+            sess["state"].update({"status": "playing", "countdown": 0})
 
     except Exception as e:
-        log.error("process_card: %s", e)
-        with state_lock:
-            state.update({"status": "error", "error": str(e)})
+        log.error("[%s] process_card: %s", session_id[:8], e)
+        with sess["lock"]:
+            sess["state"].update({"status": "error", "error": str(e)})
 
 
 # ─────────────────────────────────────────────────────────
@@ -363,29 +420,33 @@ def process_card(card_number: str):
 # ─────────────────────────────────────────────────────────
 @app.route("/api/state")
 def api_state():
-    with state_lock:
-        return jsonify(dict(state))
+    sid, is_new = get_or_create_session_id()
+    sess = get_session(sid)
+    with sess["lock"]:
+        data = dict(sess["state"])
+    data["oauth_done"] = _tidal_oauth["done"]
+    data["oauth_url"] = _tidal_oauth["url"]
+    resp = make_response(jsonify(data))
+    return session_response(resp, sid, is_new)
 
 
 @app.route("/api/oauth_status")
 def api_oauth_status():
-    with state_lock:
-        return jsonify({"done": state["oauth_done"], "url": state["oauth_url"]})
+    return jsonify({"done": _tidal_oauth["done"], "url": _tidal_oauth["url"]})
 
 
 @app.route("/api/playlists")
 def api_playlists():
     try:
         df = fetch_playlists_index()
-        games = []
-        for _, row in df[["File", "Game"]].dropna().iterrows():
-            games.append(
-                {
-                    "file": row["File"],
-                    "game": row["Game"],
-                    "cached": cache_path_for(row["File"]).exists(),
-                }
-            )
+        games = [
+            {
+                "file": row["File"],
+                "game": row["Game"],
+                "cached": cache_path_for(row["File"]).exists(),
+            }
+            for _, row in df[["File", "Game"]].dropna().iterrows()
+        ]
         return jsonify({"games": games})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -393,7 +454,8 @@ def api_playlists():
 
 @app.route("/api/select_game", methods=["POST"])
 def api_select_game():
-    global _active_df
+    sid, is_new = get_or_create_session_id()
+    sess = get_session(sid)
     data = request.get_json(force=True)
     filename = data.get("file")
     game = data.get("game")
@@ -401,9 +463,9 @@ def api_select_game():
         return jsonify({"error": "missing file"}), 400
     try:
         df = fetch_card_csv(filename)
-        _active_df = df
-        with state_lock:
-            state.update(
+        sess["active_df"] = df
+        with sess["lock"]:
+            sess["state"].update(
                 {
                     "active_game": game,
                     "active_file": filename,
@@ -414,17 +476,17 @@ def api_select_game():
                     "error": None,
                 }
             )
-        # Start cache build in background (no-op if cache already exists)
-        threading.Thread(
-            target=build_cache_async, args=(filename, df), daemon=True
-        ).start()
-        return jsonify({"ok": True, "cards": len(df)})
+        build_cache_async(filename, df, sess)
+        resp = make_response(jsonify({"ok": True, "cards": len(df)}))
+        return session_response(resp, sid, is_new)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 
 @app.route("/api/scan", methods=["POST"])
 def api_scan():
+    sid, is_new = get_or_create_session_id()
+    sess = get_session(sid)
     data = request.get_json(force=True)
     url = data.get("url", "")
     if "hitstergame.com" not in url:
@@ -432,32 +494,42 @@ def api_scan():
     card_number = extract_card_number(url)
     if not card_number:
         return jsonify({"error": "could not parse card number"}), 400
-    with state_lock:
-        if state["status"] in ("searching", "countdown"):
+    with sess["lock"]:
+        if sess["state"]["status"] in ("searching", "countdown"):
             return jsonify({"busy": True}), 200
-        state.update({"status": "searching", "card_number": card_number, "error": None})
-    threading.Thread(target=process_card, args=(card_number,), daemon=True).start()
-    return jsonify({"ok": True})
+        sess["state"].update(
+            {"status": "searching", "card_number": card_number, "error": None}
+        )
+    threading.Thread(target=process_card, args=(sid, card_number), daemon=True).start()
+    resp = make_response(jsonify({"ok": True}))
+    return session_response(resp, sid, is_new)
 
 
 @app.route("/api/play", methods=["POST"])
 def api_play():
+    sid, is_new = get_or_create_session_id()
+    sess = get_session(sid)
     data = request.get_json(force=True)
     card_number = str(data.get("card_number", "")).strip()
     if not card_number:
         return jsonify({"error": "missing card_number"}), 400
-    with state_lock:
-        if state["status"] in ("searching", "countdown"):
+    with sess["lock"]:
+        if sess["state"]["status"] in ("searching", "countdown"):
             return jsonify({"error": "busy"}), 409
-        state.update({"status": "searching", "card_number": card_number, "error": None})
-    threading.Thread(target=process_card, args=(card_number,), daemon=True).start()
-    return jsonify({"ok": True})
+        sess["state"].update(
+            {"status": "searching", "card_number": card_number, "error": None}
+        )
+    threading.Thread(target=process_card, args=(sid, card_number), daemon=True).start()
+    resp = make_response(jsonify({"ok": True}))
+    return session_response(resp, sid, is_new)
 
 
 @app.route("/api/reset", methods=["POST"])
 def api_reset():
-    with state_lock:
-        state.update(
+    sid, is_new = get_or_create_session_id()
+    sess = get_session(sid)
+    with sess["lock"]:
+        sess["state"].update(
             {
                 "status": "idle",
                 "error": None,
@@ -467,11 +539,12 @@ def api_reset():
                 "countdown": 0,
             }
         )
-    return jsonify({"ok": True})
+    resp = make_response(jsonify({"ok": True}))
+    return session_response(resp, sid, is_new)
 
 
 # ─────────────────────────────────────────────────────────
-#  HTML / JS frontend
+#  HTML / JS frontend  (unchanged from single-session version)
 # ─────────────────────────────────────────────────────────
 HTML = r"""<!doctype html>
 <html lang="en">
@@ -490,12 +563,12 @@ html,body{min-height:100%;background:var(--bg);color:var(--text);
   font-family:'DM Sans',sans-serif;overflow-x:hidden}
 .page{max-width:440px;margin:0 auto;padding:1.5rem 1rem 4rem;
   display:flex;flex-direction:column;gap:1.25rem}
-.hdr{display:flex;align-items:center;justify-content:space-between}
+.hdr{display:flex;align-items:center;justify-content:space-between;gap:.5rem}
 .logo{font-family:'Bebas Neue',sans-serif;font-size:1.9rem;letter-spacing:.06em;
   background:linear-gradient(100deg,var(--cyan),var(--pink));
-  -webkit-background-clip:text;-webkit-text-fill-color:transparent}
+  -webkit-background-clip:text;-webkit-text-fill-color:transparent;flex:1}
 .reset-btn{background:none;border:1px solid var(--border);color:var(--muted);
-  padding:.35rem .75rem;border-radius:8px;font-size:.8rem;cursor:pointer}
+  padding:.35rem .75rem;border-radius:8px;font-size:.8rem;cursor:pointer;white-space:nowrap}
 .reset-btn:hover{border-color:var(--cyan);color:var(--cyan)}
 .card{background:var(--surface);border:1px solid var(--border);
   border-radius:var(--radius);padding:1.5rem;position:relative;overflow:hidden}
@@ -504,13 +577,12 @@ html,body{min-height:100%;background:var(--bg);color:var(--text);
   pointer-events:none}
 .section-label{font-size:.72rem;color:var(--muted);text-transform:uppercase;
   letter-spacing:.1em;margin-bottom:.6rem}
-/* pill */
 .pill{display:inline-flex;align-items:center;gap:.4rem;padding:.2rem .7rem;
   border-radius:99px;font-size:.72rem;letter-spacing:.08em;
   text-transform:uppercase;font-weight:700;margin-bottom:1rem}
 .dot{width:6px;height:6px;border-radius:50%}
-.s-idle .dot{background:var(--muted)}
 .s-idle{background:rgba(74,74,106,.25);color:var(--muted)}
+.s-idle .dot{background:var(--muted)}
 .s-searching{background:rgba(0,229,192,.12);color:var(--cyan)}
 .s-searching .dot{background:var(--cyan);animation:blink .7s infinite}
 .s-countdown{background:rgba(255,45,120,.14);color:var(--pink)}
@@ -520,14 +592,12 @@ html,body{min-height:100%;background:var(--bg);color:var(--text);
 .s-error{background:rgba(255,45,120,.14);color:var(--pink)}
 .s-error .dot{background:var(--pink)}
 @keyframes blink{0%,100%{opacity:1}50%{opacity:.2}}
-/* oauth */
 .oauth-box{text-align:center;padding:.5rem 0}
 .oauth-box p{font-size:.88rem;color:var(--muted);margin-bottom:.9rem;line-height:1.5}
 .oauth-link{display:inline-block;padding:.75rem 1.5rem;
   background:linear-gradient(135deg,var(--cyan),#00b89a);
   color:#000;font-weight:700;border-radius:12px;text-decoration:none;font-size:.95rem}
 .oauth-wait{font-size:.8rem;color:var(--muted);margin-top:.75rem}
-/* game selector */
 select{width:100%;padding:.65rem .9rem;background:var(--bg);
   border:1px solid var(--border);border-radius:10px;color:var(--text);
   font-family:'DM Sans',sans-serif;font-size:.9rem;outline:none;
@@ -541,13 +611,11 @@ select:focus{border-color:var(--cyan)}
   border:none;border-radius:12px;cursor:pointer;transition:opacity .2s}
 .select-btn:hover{opacity:.85}
 .select-btn:disabled{opacity:.4;cursor:not-allowed}
-/* cache progress */
 .progress-wrap{margin-top:.9rem}
 .progress-bar-bg{background:var(--border);border-radius:99px;height:6px;overflow:hidden}
 .progress-bar{background:linear-gradient(90deg,var(--cyan),#00b89a);
   height:100%;border-radius:99px;transition:width .3s}
 .progress-label{font-size:.75rem;color:var(--muted);margin-top:.4rem}
-/* scanner */
 .scanner-wrap{position:relative;width:100%;border-radius:14px;overflow:hidden;
   background:#000;aspect-ratio:1/1;display:flex;align-items:center;justify-content:center}
 #qr-video{width:100%;height:100%;object-fit:cover;display:block}
@@ -577,14 +645,12 @@ select:focus{border-color:var(--cyan)}
   font-family:'DM Sans',sans-serif;font-weight:700;font-size:.9rem;
   border-radius:12px;cursor:pointer}
 .stop-btn:hover{border-color:var(--pink);color:var(--pink)}
-/* countdown */
 .cd-wrap{display:flex;flex-direction:column;align-items:center;gap:.75rem;padding:.75rem 0}
 .ring{position:relative;width:96px;height:96px}
 .ring svg{transform:rotate(-90deg)}
 .ring-num{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
   font-family:'Bebas Neue',sans-serif;font-size:3rem;color:var(--pink)}
 .cd-lbl{font-size:.78rem;color:var(--muted);letter-spacing:.1em;text-transform:uppercase}
-/* audio */
 .audio-wrap{margin-top:1rem}
 audio{width:100%;border-radius:10px;outline:none}
 .play-overlay{display:none;align-items:center;justify-content:center;margin-top:.75rem}
@@ -597,10 +663,8 @@ audio{width:100%;border-radius:10px;outline:none}
   font-weight:600;font-size:.85rem;border-radius:12px;
   text-decoration:none;text-align:center}
 .open-btn:hover{border-color:var(--cyan);color:var(--cyan)}
-/* error */
 .err{font-size:.83rem;color:var(--pink);background:rgba(255,45,120,.08);
   border-radius:10px;padding:.7rem;word-break:break-word;line-height:1.5}
-/* manual */
 .row{display:flex;gap:.6rem}
 input[type=text]{flex:1;padding:.65rem .9rem;background:var(--bg);
   border:1px solid var(--border);border-radius:10px;
@@ -617,10 +681,9 @@ input[type=text]:focus{border-color:var(--cyan)}
   <div class="hdr">
     <div class="logo">Hitster × Tidal</div>
     <button class="reset-btn" onclick="doReset()">↺ Reset</button>
-    <button class="reset-btn" onclick="changeGame()">⇄ Change Game</button>
+    <button class="reset-btn" onclick="changeGame()">⇄ Game</button>
   </div>
 
-  <!-- 1. Tidal OAuth -->
   <div class="card" id="oauth-card" style="display:none">
     <div class="section-label">Tidal Login Required</div>
     <div class="oauth-box">
@@ -631,12 +694,9 @@ input[type=text]:focus{border-color:var(--cyan)}
     </div>
   </div>
 
-  <!-- 2. Game selector -->
   <div class="card" id="game-card">
     <div class="section-label">Select Game</div>
-    <select id="game-select">
-      <option value="">— loading games… —</option>
-    </select>
+    <select id="game-select"><option value="">— loading games… —</option></select>
     <button class="select-btn" id="select-btn" onclick="selectGame()" disabled>
       Load Game &amp; Start Caching
     </button>
@@ -646,7 +706,6 @@ input[type=text]:focus{border-color:var(--cyan)}
     </div>
   </div>
 
-  <!-- 3. Scanner -->
   <div class="card" id="scanner-card" style="display:none">
     <div class="pill s-idle" id="scan-pill"><span class="dot"></span><span>Camera</span></div>
     <div class="scanner-wrap">
@@ -660,13 +719,11 @@ input[type=text]:focus{border-color:var(--cyan)}
       <canvas id="qr-canvas" style="display:none"></canvas>
     </div>
     <button class="start-btn" id="start-btn" onclick="startScanner()">Start Scanner</button>
-    <button class="stop-btn"  id="stop-btn"  style="display:none" onclick="stopScanner()">Stop Camera</button>
+    <button class="stop-btn" id="stop-btn" style="display:none" onclick="stopScanner()">Stop Camera</button>
   </div>
 
-  <!-- 4. Track / status -->
   <div class="card" id="track-card" style="display:none"></div>
 
-  <!-- 5. Manual entry -->
   <div class="card" id="manual-card" style="display:none">
     <div class="section-label">Manual card number</div>
     <div class="row">
@@ -677,32 +734,27 @@ input[type=text]:focus{border-color:var(--cyan)}
   </div>
 
 </div>
-
 <script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.min.js"></script>
 <script>
 const COUNTDOWN_MAX = {{ countdown }};
 let audioStarted = false;
-let currentAudio = null;  
+let currentAudio = null;
 let gameLoaded   = false;
 let gamesData    = [];
 
-// ── OAuth ──────────────────────────────────────────────────
 async function checkOAuth() {
   const r = await fetch('/api/oauth_status');
   const d = await r.json();
   const card = document.getElementById('oauth-card');
   if (d.url && !d.done) {
     card.style.display = 'block';
-    const link = document.getElementById('oauth-link');
-    link.href = d.url;
-    link.textContent = '🔐 Log in to Tidal';
+    document.getElementById('oauth-link').href = d.url;
   } else {
     card.style.display = 'none';
   }
   return d.done;
 }
 
-// ── Game selector ──────────────────────────────────────────
 async function loadGames() {
   try {
     const r = await fetch('/api/playlists');
@@ -713,7 +765,6 @@ async function loadGames() {
       gamesData.map(g =>
         `<option value="${g.file}">${g.game}${g.cached ? ' ✓' : ''}</option>`
       ).join('');
-    // Pre-select first cached game if any
     const firstCached = gamesData.find(g => g.cached);
     if (firstCached) sel.value = firstCached.file;
     document.getElementById('select-btn').disabled = false;
@@ -728,19 +779,21 @@ async function selectGame() {
   const file = sel.value;
   const game = sel.options[sel.selectedIndex]?.text || file;
   if (!file) return;
-
   const btn = document.getElementById('select-btn');
   btn.disabled = true;
   btn.textContent = 'Loading…';
-
   try {
     const r = await fetch('/api/select_game', {
-      method: 'POST',
-      headers: {'Content-Type':'application/json'},
+      method: 'POST', headers: {'Content-Type':'application/json'},
       body: JSON.stringify({file, game})
     });
     const d = await r.json();
-    if (d.error) { alert('Error: ' + d.error); btn.disabled=false; btn.textContent='Load Game & Start Caching'; return; }
+    if (d.error) {
+      alert('Error: ' + d.error);
+      btn.disabled = false;
+      btn.textContent = 'Load Game & Start Caching';
+      return;
+    }
     gameLoaded = true;
     document.getElementById('scanner-card').style.display = 'block';
     document.getElementById('manual-card').style.display  = 'block';
@@ -752,7 +805,19 @@ async function selectGame() {
   }
 }
 
-// ── QR scanner ─────────────────────────────────────────────
+function changeGame() {
+  audioStarted = false;
+  if (currentAudio) { currentAudio.pause(); currentAudio.src = ''; currentAudio = null; }
+  fetch('/api/reset', {method:'POST'});
+  document.getElementById('scanner-card').style.display  = 'none';
+  document.getElementById('manual-card').style.display   = 'none';
+  document.getElementById('track-card').style.display    = 'none';
+  document.getElementById('select-btn').textContent      = 'Load Game & Start Caching';
+  document.getElementById('select-btn').disabled         = false;
+  document.getElementById('progress-wrap').style.display = 'none';
+  gameLoaded = false;
+}
+
 let videoStream=null, scanning=false, lastScanned=null;
 const video   = document.getElementById('qr-video');
 const canvas  = document.getElementById('qr-canvas');
@@ -798,7 +863,7 @@ function tickScan(){
       lastScanned=code.data;
       setTimeout(()=>{lastScanned=null;},4000);
       audioStarted=false;
-      currentAudio=null;
+      if(currentAudio){currentAudio.pause();currentAudio.src='';currentAudio=null;}
       fetch('/api/scan',{method:'POST',headers:{'Content-Type':'application/json'},
         body:JSON.stringify({url:code.data})});
     }
@@ -806,23 +871,18 @@ function tickScan(){
   requestAnimationFrame(tickScan);
 }
 
-// ── State polling ──────────────────────────────────────────
 async function poll(){
   try{
     const r=await fetch('/api/state');
     const d=await r.json();
-
-    // OAuth check
     if(!d.oauth_done && d.oauth_url){
       document.getElementById('oauth-card').style.display='block';
       document.getElementById('oauth-link').href=d.oauth_url;
     } else {
       document.getElementById('oauth-card').style.display='none';
     }
-
-    // Cache progress
     if(d.cache_status==='building' && d.cache_total>0){
-      const pct = Math.round(100*d.cache_progress/d.cache_total);
+      const pct=Math.round(100*d.cache_progress/d.cache_total);
       document.getElementById('progress-wrap').style.display='block';
       document.getElementById('progress-bar').style.width=pct+'%';
       document.getElementById('progress-label').textContent=
@@ -832,7 +892,6 @@ async function poll(){
       document.getElementById('progress-bar').style.width='100%';
       document.getElementById('progress-label').textContent='✓ Cache ready';
     }
-
     renderTrackCard(d);
   }catch(e){}
 }
@@ -841,13 +900,11 @@ function renderTrackCard(d){
   const el=document.getElementById('track-card');
   if(d.status==='idle'){el.style.display='none';return;}
   el.style.display='block';
-
   const pillTxt={searching:'Searching…',countdown:'Get ready!',
                  playing:'Playing',error:'Error'}[d.status]||d.status;
   let body='';
-
   if(d.status==='searching'){
-    if(currentAudio){ currentAudio.pause(); currentAudio.src=''; currentAudio=null; } 
+    if(currentAudio){currentAudio.pause();currentAudio.src='';currentAudio=null;}
     body=`<div style="text-align:center;padding:1.5rem;color:var(--muted)">
       🔍 Looking up card #${d.card_number||'?'} …</div>`;
   } else if(d.status==='countdown'){
@@ -871,20 +928,12 @@ function renderTrackCard(d){
   } else if(d.status==='error'){
     body=`<div class="err">⚠ ${d.error||'Unknown error'}</div>`;
   }
-
   const key=d.status+'|'+d.countdown+'|'+(d.stream_url||'');
   if(el.dataset.rendered!==key){
     el.dataset.rendered=key;
-    // Stop any currently playing audio before replacing the element
-    const prev = document.getElementById('tidal-audio');
-    if (prev) { prev.pause(); prev.src = ''; }
     el.innerHTML=`<div class="pill s-${d.status}"><span class="dot"></span><span>${pillTxt}</span></div>${body}`;
-    if(d.status==='playing'){
-      // Slight delay so the <audio> element is in the DOM
-      setTimeout(tryAutoplay, 80);
-    }
+    if(d.status==='playing') setTimeout(tryAutoplay,80);
   } else if(d.status==='playing' && !audioStarted){
-    // DOM unchanged but playback not confirmed yet — keep retrying
     tryAutoplay();
   }
 }
@@ -905,59 +954,41 @@ function renderCountdown(n){
   </div>`;
 }
 
-function tryAutoplay() {
-  const audio = document.getElementById('tidal-audio');
-  if (!audio || audioStarted) return;
-  currentAudio = audio; 
-  audio.play().then(() => {
-    audioStarted = true;
-    document.getElementById('play-overlay').style.display = 'none';
-  }).catch(() => { /* tap-to-play button stays visible */ });
+function tryAutoplay(){
+  const audio=document.getElementById('tidal-audio');
+  if(!audio||audioStarted) return;
+  currentAudio=audio;
+  audio.play().then(()=>{
+    audioStarted=true;
+    document.getElementById('play-overlay').style.display='none';
+  }).catch(()=>{});
 }
-function manualPlay() {
-  const a = document.getElementById('tidal-audio');
-  if (!a) return;
-  currentAudio = a; 
-  a.play().then(() => {
-    audioStarted = true;
-    document.getElementById('play-overlay').style.display = 'none';
-  }).catch(() => {});
+function manualPlay(){
+  const a=document.getElementById('tidal-audio');
+  if(!a) return;
+  currentAudio=a;
+  a.play().then(()=>{
+    audioStarted=true;
+    document.getElementById('play-overlay').style.display='none';
+  }).catch(()=>{});
 }
-
-// Retry play on any user interaction — covers the case where the gesture
-// happened before the <audio> element existed
-document.addEventListener('click',      () => { if (!audioStarted) tryAutoplay(); });
-document.addEventListener('touchstart', () => { if (!audioStarted) tryAutoplay(); }, {passive:true});
+document.addEventListener('click',      ()=>{if(!audioStarted)tryAutoplay();});
+document.addEventListener('touchstart', ()=>{if(!audioStarted)tryAutoplay();},{passive:true});
 
 function submitManual(){
   const val=document.getElementById('manual-input').value.trim();
   if(!val) return;
   audioStarted=false;
-  currentAudio=null;
+  if(currentAudio){currentAudio.pause();currentAudio.src='';currentAudio=null;}
   fetch('/api/play',{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({card_number:val})});
 }
 function doReset(){
-    audioStarted=false;
-    currentAudio=null;
-    fetch('/api/reset',{method:'POST'});
+  audioStarted=false;
+  if(currentAudio){currentAudio.pause();currentAudio.src='';currentAudio=null;}
+  fetch('/api/reset',{method:'POST'});
 }
 
-function changeGame() {
-  audioStarted = false;
-  if (currentAudio) { currentAudio.pause(); currentAudio.src = ''; currentAudio = null; }
-  fetch('/api/reset', {method:'POST'});
-  // Hide scanner and manual entry, show game selector
-  document.getElementById('scanner-card').style.display = 'none';
-  document.getElementById('manual-card').style.display  = 'none';
-  document.getElementById('track-card').style.display   = 'none';
-  document.getElementById('select-btn').textContent     = 'Load Game & Start Caching';
-  document.getElementById('select-btn').disabled        = false;
-  document.getElementById('progress-wrap').style.display = 'none';
-  gameLoaded = false;
-}
-
-// ── Boot ───────────────────────────────────────────────────
 (async()=>{
   await checkOAuth();
   await loadGames();
@@ -971,7 +1002,10 @@ function changeGame() {
 
 @app.route("/")
 def index():
-    return render_template_string(HTML, countdown=COUNTDOWN_SEC)
+    sid, is_new = get_or_create_session_id()
+    get_session(sid)  # ensure session exists
+    resp = make_response(render_template_string(HTML, countdown=COUNTDOWN_SEC))
+    return session_response(resp, sid, is_new)
 
 
 # ─────────────────────────────────────────────────────────
@@ -997,26 +1031,16 @@ def ensure_self_signed_cert():
         local_ip = _socket.gethostbyname(_socket.gethostname())
     except Exception:
         local_ip = "127.0.0.1"
-
     key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     subj = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, local_ip)])
-    san = x509.SubjectAlternativeName(
-        [
-            x509.DNSName("localhost"),
-            x509.IPAddress(ipaddress.IPv4Address("127.0.0.1")),
-        ]
-    )
+    sans = [
+        x509.DNSName("localhost"),
+        x509.IPAddress(ipaddress.IPv4Address("127.0.0.1")),
+    ]
     try:
-        san = x509.SubjectAlternativeName(
-            [
-                x509.DNSName("localhost"),
-                x509.IPAddress(ipaddress.IPv4Address("127.0.0.1")),
-                x509.IPAddress(ipaddress.IPv4Address(local_ip)),
-            ]
-        )
+        sans.append(x509.IPAddress(ipaddress.IPv4Address(local_ip)))
     except Exception:
         pass
-
     cert = (
         x509.CertificateBuilder()
         .subject_name(subj)
@@ -1025,10 +1049,9 @@ def ensure_self_signed_cert():
         .serial_number(x509.random_serial_number())
         .not_valid_before(datetime.datetime.utcnow())
         .not_valid_after(datetime.datetime.utcnow() + datetime.timedelta(days=3650))
-        .add_extension(san, critical=False)
+        .add_extension(x509.SubjectAlternativeName(sans), critical=False)
         .sign(key, hashes.SHA256())
     )
-
     cert_path.parent.mkdir(parents=True, exist_ok=True)
     key_path.write_bytes(
         key.private_bytes(
@@ -1038,7 +1061,7 @@ def ensure_self_signed_cert():
         )
     )
     cert_path.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
-    log.info("TLS: cert written to /data/")
+    log.info("TLS: cert written.")
     return str(cert_path), str(key_path)
 
 
@@ -1047,31 +1070,23 @@ def ensure_self_signed_cert():
 # ─────────────────────────────────────────────────────────
 if __name__ == "__main__":
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
-
-    # Start Tidal auth (non-blocking — URL shown in UI if needed)
     get_tidal_session()
-
-    # Pre-fetch playlist index
     try:
         fetch_playlists_index()
     except Exception as e:
         log.warning("Could not fetch playlists index: %s", e)
-
     cert_file, key_file = ensure_self_signed_cert()
-
     import socket
 
     try:
         local_ip = socket.gethostbyname(socket.gethostname())
     except Exception:
         local_ip = "localhost"
-
     log.info("=" * 55)
     log.info("  Desktop:  https://localhost:%d", FLASK_PORT)
     log.info("  Phone:    https://%s:%d", local_ip, FLASK_PORT)
     log.info("  Accept cert warning once: Advanced → Proceed")
     log.info("=" * 55)
-
     app.run(
         host="0.0.0.0",
         port=FLASK_PORT,
