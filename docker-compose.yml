@@ -5,9 +5,9 @@ services:
       # Docker clones this repo and uses its Dockerfile automatically.
       # To pin a specific branch or tag:
       # context: https://github.com/maahn/hitster-tidal.git#main
+      network: host
     container_name: hitster-tidal
-    ports:
-      - "6001:6001"
+    network_mode: host
     volumes:
       # Persists Tidal token, TLS cert, and Tidal ID caches between restarts.
       # Change the left side to any host path you prefer.
